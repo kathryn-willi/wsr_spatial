@@ -1,0 +1,307 @@
+---
+title: "Spatial Analysis of Water Quality Data in Wild and Scenic River Watersheds"
+author: "Kathryn Willi"
+date: "12/9/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(nhdplusTools)
+library(sf)
+library(feather)
+library(mapview)
+library(kableExtra)
+
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_chunk$set(error = FALSE)
+knitr::opts_chunk$set(tidy = TRUE)
+knitr::opts_chunk$set(fig.align = 'center')
+```
+# Background
+
+The Wild and Scenic Rivers Act establishes water quality as one of the three fundamental values of a Wild and Scenic River (WSR) that river managing agencies must protect and enhance. However, a recent report revealed that over half of all WSRs have impaired water quality as defined by the Clean Water Act (Willi & Back, 2018). Although assessing water quality through the lens of the Clean Water Act is an essential component to evaluating the water quality status of the National WSR System, there are other important aspects of WSR water quality that were not analyzed or addressed in the report. Namely, looking at the same water quality parameters across WSRs as well as looking beyond their designated WSR corridors could provide a more hollisitic, comparable, and consistent approach at assessing WSR water quality.
+
+To perform this type of assessment I hope to use pre-existing water quality data to analyze the condition of WSR watershed water quality. As part of this research, it is important to first identify locations within WSR watersheds that have water quality data. This report aims to identify a method to select water quality monitoring sites within WSR watersheds and categorize them based on their distance away from the WSR.
+
+# General Methodology
+
+Monitoring site information was pulled from the federally-maintained [Water Quality Portal (WQP)](https://www.waterqualitydata.us/), a publically available data warehouse that contains chemical, biological, and physical observations from over 1.5 million water monitoring sites across the nation. The R packages [sf](https://cran.r-project.org/web/packages/sf/sf.pdf) and [mapview](https://cran.r-project.org/web/packages/mapview/mapview.pdf) were used to work with all WQP and WSR watershed information as spatial objects, while the package [nhdplusTools](https://cran.r-project.org/web/packages/nhdplusTools/nhdplusTools.pdf) was used to associate these features with the National Hydrogrpahy Dataset (NHD). Once associated with NHD features, the "upstream trace" function in [nhdplusTools](https://cran.r-project.org/web/packages/nhdplusTools/nhdplusTools.pdf) was used to identify each monitoring site's distance upstream of the designated WSR reach. To test the methodology, the Bluestone WSR in West Virginia was used as a pilot for the National WSR System. In addition, WQP sites were categorized as being either within the designated WSR or 0-5, 5-10, 10-20, 20-50, or 50+ kilometers (km) upstream of the designated WSR's downstream starting point. The following section outlines the step-by-step process used for identifying and cateogrizing WQP monitoring sites within the Bluestone WSR watershed.  
+
+# Code
+
+##### **Read in the WSR designated reach flowline and its associated starting point.**
+```{r echo=TRUE, results='hide'}
+wsr_flowline <- st_read('data/bluestone_wsr.shp') %>%
+  st_transform(2163) #I consistently use st_transform instead of st_crs because st_join cannot be applied to crs objects(...?)
+
+wsr_downstream_point <- st_read('data/bluestone_downstream_point.shp') %>%
+  st_transform(2163) 
+```
+<center>
+```{r echo=FALSE}
+mapview(wsr_downstream_point, layer.name = 'WSR Starting Point') + mapview(wsr_flowline, layer.name = 'Designated WSR')
+```
+</center>
+
+
+
+##### **Read in water quality site data from the entire WQP database.**
+```{r echo=TRUE, results='hide'}
+wq_table <- read_feather('data/unique_site_inventory.feather') %>%
+  filter(source == 'WQP') #removing LAGOS monitoring sites (for now)
+
+wq_spatial <- wq_table %>%
+  st_as_sf(.,coords=c('long','lat'), 
+           remove = FALSE,
+           crs=4326) %>%
+  st_transform(2163)
+```
+
+
+
+##### **Read in NHDPlusv2.1 flowlines to be used in [nhdplusTools](https://cran.r-project.org/web/packages/nhdplusTools/nhdplusTools.pdf), and identify the WSR navigation start point's associated NHD flowline.**
+```{r echo=TRUE, results='hide'}
+flowlines <- read_sf('data/nhdplus_v21.shp') %>%
+  st_zm() %>% #for future functions to work
+  st_transform(2163) %>%
+  align_nhdplus_names() #verify that flowline features have appropriate COMID for future functions.
+
+start_point <- discover_nhdplus_id(wsr_downstream_point) #the ID that nhdplusTools will know to begin the upstream trace from.
+```
+
+
+
+##### **Select only NHDPlusv2.1 flowline features upstream of the WSR.**
+```{r}
+upstream_nhd <- get_UT(flowlines, start_point) #upstream trace function in nhdplusTools
+
+wsr_upstream_flowlines <- dplyr::filter(flowlines, COMID %in% upstream_nhd)
+```
+<center>
+```{r, echo=FALSE}
+mapview(wsr_upstream_flowlines, layer.name = 'WSR Upstream Flowline Features') + mapview(wsr_downstream_point, layer.name='WSR Downstream Point', legend=FALSE)
+```
+</center>
+
+
+
+##### **Create a quarter-mile buffer around the upstream NHD flowline features to capture WQP monitoring sites that are not directly atop the NHD flowline features.**
+```{r}
+nhd_buffer_UT <- st_buffer(wsr_upstream_flowlines, 403, endCapStyle='ROUND') #403 meters is roughly a 1/4 mile
+
+wq_sites_within <- wq_spatial[nhd_buffer_UT,] %>%
+  st_zm() #for future functions to work
+
+wq_sites_with_comid <- wq_sites_within %>%
+  st_join(., wsr_upstream_flowlines, join=st_nearest_feature, left=TRUE) #keep only WQP sites within the 1/4 NHD buffer
+
+wq_sites_with_comid_table <- wq_sites_with_comid %>%
+  as_tibble() %>%
+  select('SiteID', 'REACHCODE', 'COMID', 'LENGTHKM') #get rid of unnecessary data
+```
+
+
+
+##### **Identify NHD flowline features that are up to 5-, 10-, 20-, 50-, and 50+ km upstream of the WSR starting navigation point.**
+```{r}
+upstream_5km <- get_UT(wsr_upstream_flowlines, start_point, distance = 5) 
+upstream_10km <- get_UT(wsr_upstream_flowlines, start_point, distance = 10) 
+upstream_20km <- get_UT(wsr_upstream_flowlines, start_point, distance = 20)
+upstream_50km <- get_UT(wsr_upstream_flowlines, start_point, distance = 50)
+upstream_beyond <- get_UT(wsr_upstream_flowlines, start_point)
+```
+
+
+
+##### **Identify and then categorize the WQP monitoring sites by distance from the WSR starting point (i.e. 0-5 km, 5-10 km, 10-20 km, 20-50 km, and 50+ km) so that there are no duplicates among distances.* **
+###### *For example, we do not want a monitoring site that is 8 km upstream to be lumped as both 0-5 km and 5-10 km upstream. Instead we want it to be identified as only 5-10 km upstream.
+```{r}
+zero_to_five_km_UT <- upstream_5km %>%
+  as_tibble () %>%
+  rename(COMID = value) %>%
+  inner_join(wq_sites_with_comid_table, by = 'COMID') %>%
+  mutate(DISTANCE = "0-5 km Upstream")
+
+five_to_ten_km_UT <- upstream_10km[!(upstream_10km %in% upstream_5km)] %>%
+  as_tibble() %>%
+  rename(COMID = value) %>%
+  inner_join(wq_sites_with_comid_table, by = 'COMID') %>%
+  mutate(DISTANCE = "5-10 km Upstream")
+
+ten_to_twenty_km_UT <- upstream_20km[!(upstream_20km %in% upstream_10km)] %>%
+  as_tibble() %>%
+  rename(COMID = value) %>%
+  inner_join(wq_sites_with_comid_table, by = 'COMID') %>%
+  mutate(DISTANCE = "10-20 km Upstream")
+
+twenty_to_fifty_km_UT <- upstream_50km[!(upstream_50km %in% upstream_20km)] %>%
+  as_tibble() %>%
+  rename(COMID = value) %>%
+  inner_join(wq_sites_with_comid_table, by = 'COMID') %>%
+  mutate(DISTANCE = "20-50 km Upstream")
+
+fifty_beyond_UT <- upstream_beyond[!(upstream_beyond %in% upstream_50km)] %>%
+  as_tibble() %>%
+  rename(COMID = value) %>%
+  inner_join(wq_sites_with_comid_table, by = 'COMID') %>%
+  mutate(DISTANCE = "50+ km Upstream")
+
+wsr_upstream_wqp <- Reduce(function(x, y) merge(x, y, all=TRUE), list(zero_to_five_km_UT, five_to_ten_km_UT, ten_to_twenty_km_UT, twenty_to_fifty_km_UT, fifty_beyond_UT)) %>% #join all wqp sites back together
+  mutate(WSR = "Bluestone WSR")  #though unimportant when looking at only one WSR, this step will be important when I extend this code to include all WSRs.
+
+spatial_upstream_wqp <- sp::merge(wq_sites_with_comid, wsr_upstream_wqp, by='SiteID')
+```
+
+
+
+##### **Identify WQP monitoring sites within the designated reach of the WSR, then join that data with the other WQP monitoring site data.** 
+```{r}
+wsr_buffer <- st_buffer(wsr_flowline, 403, endCapStyle='FLAT') #'FLAT' to keep upstream/downstream ends out of selection range.
+
+all_wsr_wq_table <- wq_spatial[wsr_buffer,] %>%
+  as_tibble %>%
+  mutate(WSR = "Bluestone WSR", 
+         DISTANCE='Along WSR') %>%
+  base::merge(wsr_upstream_wqp, all.x=TRUE, all.y=TRUE) %>%
+  select("SiteID", "WSR", "DISTANCE") %>%
+  arrange(desc(DISTANCE)) %>%
+  distinct(SiteID, .keep_all = TRUE)
+
+all_wsr_wq_spatial <- sp::merge(wq_spatial, all_wsr_wq_table, by = 'SiteID', all.x = FALSE)
+```
+
+
+
+##### **For Mapping/Additional Flowline Data:** *Identify and then categorize NHD flowlines by distance from the WSR starting point (i.e. 0-5 km, 5-10 km, 10-20 km, 20-50 km, and 50+ km) so that there are no duplicates among distances. This code is nearly identical to the WQP site code upstream.*
+```{r, echo=TRUE}
+wsr_upstream_flowline_table <- dplyr::filter(flowlines, COMID %in% upstream_nhd) %>%
+  as_tibble()
+
+zero_to_five_km_nhd <- upstream_5km %>%
+  as_tibble () %>%
+  rename(COMID = value) %>%
+  inner_join(wsr_upstream_flowline_table, by = 'COMID') %>%
+  mutate(DISTANCE = "0-5 km Upstream") %>%
+  select('DISTANCE','COMID', 'LENGTHKM') 
+
+five_to_ten_km_nhd <- upstream_10km[!(upstream_10km %in% upstream_5km)] %>%
+  as_tibble() %>%
+  rename(COMID = value) %>%
+  inner_join(wsr_upstream_flowline_table, by = 'COMID') %>%
+  mutate(DISTANCE = "5-10 km Upstream") %>%
+  select('DISTANCE','COMID', 'LENGTHKM') 
+
+ten_to_twenty_km_nhd <- upstream_20km[!(upstream_20km %in% upstream_10km)] %>%
+  as_tibble() %>%
+  rename(COMID = value) %>%
+  inner_join(wsr_upstream_flowline_table, by = 'COMID') %>%
+  mutate(DISTANCE = "10-20 km Upstream") %>%
+  select('DISTANCE','COMID', 'LENGTHKM') 
+
+twenty_to_fifty_km_nhd <- upstream_50km[!(upstream_50km %in% upstream_20km)] %>%
+  as_tibble() %>%
+  rename(COMID = value) %>%
+  inner_join(wsr_upstream_flowline_table, by = 'COMID') %>%
+  mutate(DISTANCE = "20-50 km Upstream") %>%
+  select('DISTANCE','COMID', 'LENGTHKM') 
+
+fifty_beyond_nhd <- upstream_beyond[!(upstream_beyond %in% upstream_50km)] %>%
+  as_tibble() %>%
+  rename(COMID = value) %>%
+  inner_join(wsr_upstream_flowline_table, by = 'COMID') %>%
+  mutate(DISTANCE = "50+ km Upstream") %>%
+  select('DISTANCE','COMID', 'LENGTHKM') 
+
+within_nhd <- wsr_flowline %>%
+  mutate(DISTANCE = "Along") %>%
+  select('DISTANCE')
+
+wsr_nhd_cats <- Reduce(function(x, y) merge(x, y, all=TRUE), list(zero_to_five_km_nhd, five_to_ten_km_nhd, ten_to_twenty_km_nhd, twenty_to_fifty_km_nhd, fifty_beyond_nhd))
+
+wsr_nhd_cat_spatial <- sp::merge(flowlines, wsr_nhd_cats, by = 'COMID', all.x = FALSE) %>%
+  select('DISTANCE') %>% 
+  rbind(., within_nhd) #join all NHD flowlines back together
+```
+
+## Final Products from Code:
+
+A dataset that contains WQP monitoring sites within the Bluestone WSR's hydrologic network, categorized by their distance upstream of the WSR's starting point. The *SiteID* contained within the dataset can be used to select all associated water quality observations for that monitoring site from the WQP.
+
+<center>
+```{r, echo=FALSE}
+mapview(wsr_nhd_cat_spatial, zcol='DISTANCE', layer.name = 'Distance Upstream') + mapview(all_wsr_wq_spatial, zcol='DISTANCE', layer.name = 'WQP Monitoring Sites', legend = FALSE)
+ 
+knitr::kable(all_wsr_wq_table,caption = "WQP Monitoring Sites within the Bluestone WSR Watershed") %>%
+  kable_styling() %>%
+  scroll_box(width = '500px', height='600px')
+```
+</center>
+
+
+... and in the future for all WSRs, a dataset with information such as total watershed network length, total number of monitoring sites within the watershed, and a nested tibble containing the list of all monitoring sites.
+```{r}
+site_count_table <- all_wsr_wq_table %>%
+  group_by(WSR, DISTANCE) %>%
+  summarize(site_count = n_distinct(SiteID)) %>%
+  spread(DISTANCE, site_count)
+
+WSR_table <- wsr_nhd_cats %>% 
+  mutate(WSR='Bluestone WSR') %>%
+  group_by(WSR) %>%
+  summarize(network_length_km=sum(LENGTHKM)) %>%
+  inner_join(all_wsr_wq_table, by='WSR') %>%
+  inner_join(site_count_table, by='WSR') %>%
+  nest(SiteID, DISTANCE)
+```
+<center>
+```{r, echo=FALSE}
+wsr_dummy<- (tibble(WSR=c('Bluestone WSR', 'Virgin WSR','Rogue WSR','...'),
+              network_length_km=c(1060.217,'...', '...','...'),
+              count_0_5km=c(0,'...', '...','...'),
+              count_10_20km=c(1, '...', '...','...'),
+              count_20_50km=c(5, '...', '...','...'),
+              count_50pluskm=c(42,'...', '...','...'),
+              count_along_wsr=c(5,'...', '...','...'),
+              site_data='Nested Tibble'))
+knitr:: kable(wsr_dummy, caption="WSR Monitoring Site Information - MOCK UP") %>%
+  kable_styling(full_width = FALSE)
+```  
+ </center> 
+  
+## Improvements to nhdplusTools
+
+After the above methodology was finalized it was used on additional starting points to see whether it worked for other WSRs. Unfortunately this exposed an issue within [nhdplusTools](https://cran.r-project.org/web/packages/nhdplusTools/nhdplusTools.pdf) that was not resolved before finalizing this report. For some reaches within the NHD, both the trace upstream and trace downstream functions begin the trace well downstream or upstream of the designated starting point. For example, to trace upstream of the following point in the Bluestone WSR watershed will result in the following erroneous upstream trace:
+```{r, echo = TRUE, results = 'hide'}
+wsr_example_point <- st_read('data/bluestone_upstream_point.shp') %>%
+  st_transform(2163)
+
+start_point_example <- discover_nhdplus_id(wsr_example_point)
+
+upstream_nhd_example <- get_UT(flowlines, start_point_example, distance = 10) #this SHOULD identify flowlines up to 10 km upstream of starting point 
+
+wsr_example_flowlines <- dplyr::filter(flowlines, COMID %in% upstream_nhd_example)
+```
+<center>
+```{r, echo = FALSE}
+mapview(wsr_example_point, layer.name='Starting Point') + mapview(wsr_example_flowlines, layer.name='Upstream Flowline Features')
+```
+</center>
+... while tracing downstream of the same point will result in the following erroneous downstream trace:
+```{r}
+example_DM_nhd <- get_DM(flowlines, start_point_example, distance = 100) #this SHOULD identify flowlines up to 100 km downstream of starting point
+
+example_DM_flowlines <- dplyr::filter(flowlines, COMID %in% example_DM_nhd)
+```
+<center>
+```{r, echo=FALSE}
+mapview(wsr_example_point, layer.name='Starting Point') + mapview(example_DM_flowlines, layer.name='Downstream Flowline Features')
+```
+</center>
+
+
+#### Work Cited
+
+Willi, K. and J. Back (2018). Evaluation of state water quality assessments and the national wild and scenic rivers system [White paper]. Retrieved December 10, 2019 from the Interagency Wild and Scenic River Coordinating Council: https://www.rivers.gov/documents/state-water-quality-assessments.pdf
+
